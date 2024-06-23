@@ -491,6 +491,576 @@ float* forward(Mamba* mamba, int token) {
     return s->logits;
 }
 
+// ---------------------------------------------------------------------------
+// Training related stuff
+
+void linear_grad(float* dOut, float* x, float* w, float* b, float* dx, float* dw, float* db, int d, int n) {
+    // Gradient of linear operation with respect to x, w, and b
+    for (int i = 0; i < d; i++) {
+        for (int j = 0; j < n; j++) {
+            dx[j] += dOut[i] * w[i * n + j];
+            dw[i * n + j] += dOut[i] * x[j];
+        }
+        db[i] += dOut[i];
+    }
+}
+
+void rmsnorm_grad(float* dOut, float* x, float* weight, float* dx, float* dWeight, int size) {
+    // Gradient of rmsnorm operation with respect to x and weight
+    float ss = 0.0f;
+    for (int j = 0; j < size; j++) {
+        ss += x[j] * x[j];
+    }
+    ss /= size;
+    ss += 1e-5f;
+    float ss_inv_sqrt = 1.0f / sqrtf(ss);
+    
+    for (int j = 0; j < size; j++) {
+        dx[j] += dOut[j] * weight[j] * ss_inv_sqrt;
+        // Note: This is a simplified gradient calculation for RMSNorm.
+        // The full gradient would also involve derivatives w.r.t. the sum of squares `ss`
+        // and would be more complex to implement correctly.
+        dWeight[j] += dOut[j] * x[j] * ss_inv_sqrt;
+    }
+}
+
+void matmul_grad(float* dOut, float* x, float* w, float* dx, float* dw, int d, int n) {
+    // Gradient of matrix multiplication operation with respect to x and w
+    for (int i = 0; i < d; i++) {
+        for (int j = 0; j < n; j++) {
+            dx[j] += dOut[i] * w[i * n + j];
+            dw[i * n + j] += dOut[i] * x[j];
+        }
+    }
+}
+
+void softmax_grad(float* dOut, float* x, float* dx, int size) {
+    // Gradient of softmax operation with respect to x
+    float sum = 0.0f;
+    for (int i = 0; i < size; i++) {
+        sum += dOut[i] * x[i];
+    }
+    for (int i = 0; i < size; i++) {
+        dx[i] += x[i] * (dOut[i] - sum);
+    }
+}
+
+void rowwise_dot_product_grad(float* dOut, float* matrix, float* weights, float* dMatrix, float* dWeights, int rows, int cols) {
+    #pragma omp parallel for
+    for (int i = 0; i < rows; i++) {
+        for (int j = 0; j < cols; j++) {
+            dMatrix[i * cols + j] += dOut[i] * weights[j];
+            dWeights[j] += dOut[i] * matrix[i * cols + j];
+        }
+    }
+}
+
+void elementwise_multiply_grad(float* dOut, float* x, float* y, float* dx, float* dy, int total_elements) {
+    // Gradient of element-wise multiplication operation with respect to x and y
+    for (int i = 0; i < total_elements; i++) {
+        dx[i] += dOut[i] * y[i];
+        dy[i] += dOut[i] * x[i];
+    }
+}
+
+void elementwise_add_grad(float* dOut, float* dx, float* dy, int total_elements) {
+    // Gradient of element-wise addition operation with respect to x and y
+    for (int i = 0; i < total_elements; i++) {
+        dx[i] += dOut[i];
+        dy[i] += dOut[i];
+    }
+}
+
+
+void elementwise_multiply_and_add_grad(float* dResult, float* matrix1, float* matrix2, float* matrix3, float* dMatrix1, float* dMatrix2, float* dMatrix3, int total_elements) {
+    #pragma omp parallel for
+    for (int i = 0; i < total_elements; i++) {
+        dMatrix1[i] += dResult[i] * matrix2[i];
+        dMatrix2[i] += dResult[i] * matrix1[i];
+        dMatrix3[i] += dResult[i];
+    }
+}
+
+void broadcast_multiply_grad(float* dResult, float* x, float* y, float* dx, float* dy, int d, int n) {
+    // Assuming y[n] is broadcasted to match x[d] in each operation, resulting in dResult[d,n]
+    #pragma omp parallel for
+    for (int i = 0; i < d; i++) {
+        for (int j = 0; j < n; j++) {
+            int idx = i * n + j;
+            dx[i] += dResult[idx] * y[j];
+            dy[j] += dResult[idx] * x[i];
+        }
+    }
+}
+
+void outer_product_grad(float* dOut, float* x, float* y, float* dx, float* dy, int d, int n) {
+    #pragma omp parallel for
+    for (int i = 0; i < d; i++) {
+        for (int j = 0; j < n; j++) {
+            dx[i] += dOut[i * n + j] * y[j];
+            dy[j] += dOut[i * n + j] * x[i];
+        }
+    }
+}
+
+void sum_along_last_dim_grad(float* dResult, float* dMatrix, int rows, int cols) {
+    #pragma omp parallel for
+    for (int i = 0; i < rows; i++) {
+        for (int j = 0; j < cols; j++) {
+            dMatrix[i * cols + j] += dResult[i];
+        }
+    }
+}
+
+// Gradient of SiLU (Swish) function
+float silu_grad(float x) {
+    float sig_x = sigmoid(x);
+    return sig_x + x * sig_x * (1 - sig_x); // Derivative of SiLU
+}
+
+// Gradient of Softplus function
+float softplus_grad(float x) {
+    return sigmoid(x); // Derivative of softplus is the sigmoid function
+}
+
+float cross_entropy_loss(float** logits, int* targets, int batch_size, int num_classes) {
+    float loss = 0.0;
+    for (int i = 0; i < batch_size; ++i) {
+        // Apply softmax to convert logits to probabilities
+        softmax(logits[i], num_classes);
+
+        // Calculate the negative log likelihood of the true class
+        int target = targets[i];
+        if (target >= 0 && target < num_classes) {
+            loss += -log(logits[i][target] + 1e-9); // Add a small value to prevent log(0)
+        } else {
+            fprintf(stderr, "Invalid target class index: %d\n", target);
+            exit(EXIT_FAILURE);
+        }
+    }
+    // Return the average loss over the batch
+    return loss / batch_size;
+}
+
+float cross_entropy_loss_and_grad(float** logits, int* targets, int batch_size, int num_classes, float** dLogits) {
+    float loss = 0.0;
+    for (int i = 0; i < batch_size; ++i) {
+        // Apply softmax to convert logits to probabilities
+        softmax(logits[i], num_classes);
+
+        // Calculate the negative log likelihood of the true class
+        int target = targets[i];
+        if (target >= 0 && target < num_classes) {
+            loss += -log(logits[i][target] + 1e-9); // Add a small value to prevent log(0)
+            // Compute gradient for cross-entropy loss
+            for (int j = 0; j < num_classes; ++j) {
+                dLogits[i][j] = logits[i][j]; // derivative of softmax
+                if (j == target) {
+                    dLogits[i][j] -= 1.0; // derivative of -log(x)
+                }
+            }
+        } else {
+            fprintf(stderr, "Invalid target class index: %d\n", target);
+            exit(EXIT_FAILURE);
+        }
+    }
+    // Return the average loss over the batch
+    return loss / batch_size;
+}
+
+void apply_ema_update(float* gradients, float* weights, int size, float alpha, float lamb) {
+    for (int i = 0; i < size; i++) {
+        gradients[i] = gradients[i] * alpha + gradients[i] * (1 - alpha);
+        weights[i] += gradients[i] * lamb;
+    }
+}
+
+void gradfilter_ema(Mamba* mamba, float alpha, float lamb) {
+    MambaGradients* g = &mamba->gradients;
+    MambaWeights* w = &mamba->weights;
+
+    // Apply EMA filtering and gradient adjustment for each parameter using helper function
+    apply_ema_update(g->token_embedding_table_grad, w->token_embedding_table, mamba->config.rounded_vocab_size * mamba->config.dim, alpha, lamb);
+
+    for (int l = 0; l < mamba->config.n_layers; l++) {
+        apply_ema_update(&g->in_proj_grad[l * 2 * mamba->config.d_inner * mamba->config.dim], &w->in_proj[l * 2 * mamba->config.d_inner * mamba->config.dim], 2 * mamba->config.d_inner * mamba->config.dim, alpha, lamb);
+        apply_ema_update(&g->conv1d_weight_grad[l * mamba->config.d_inner * mamba->config.d_conv], &w->conv1d_weight[l * mamba->config.d_inner * mamba->config.d_conv], mamba->config.d_inner * mamba->config.d_conv, alpha, lamb);
+        apply_ema_update(&g->conv1d_bias_grad[l * mamba->config.d_inner], &w->conv1d_bias[l * mamba->config.d_inner], mamba->config.d_inner, alpha, lamb);
+        apply_ema_update(&g->x_proj_grad[l * (mamba->config.dt_rank + 2 * mamba->config.d_state) * mamba->config.d_inner], &w->x_proj[l * (mamba->config.dt_rank + 2 * mamba->config.d_state) * mamba->config.d_inner], (mamba->config.dt_rank + 2 * mamba->config.d_state) * mamba->config.d_inner, alpha, lamb);
+        apply_ema_update(&g->dt_proj_weight_grad[l * mamba->config.d_inner * mamba->config.dt_rank], &w->dt_proj_weight[l * mamba->config.d_inner * mamba->config.dt_rank], mamba->config.d_inner * mamba->config.dt_rank, alpha, lamb);
+        apply_ema_update(&g->dt_proj_bias_grad[l * mamba->config.d_inner], &w->dt_proj_bias[l * mamba->config.d_inner], mamba->config.d_inner, alpha, lamb);
+        apply_ema_update(&g->A_grad[l * mamba->config.d_inner * mamba->config.d_state], &w->A[l * mamba->config.d_inner * mamba->config.d_state], mamba->config.d_inner * mamba->config.d_state, alpha, lamb);
+        apply_ema_update(&g->D_grad[l * mamba->config.d_inner], &w->D[l * mamba->config.d_inner], mamba->config.d_inner, alpha, lamb);
+        apply_ema_update(&g->out_proj_grad[l * mamba->config.dim * mamba->config.d_inner], &w->out_proj[l * mamba->config.dim * mamba->config.d_inner], mamba->config.dim * mamba->config.d_inner, alpha, lamb);
+        apply_ema_update(&g->norm_grad[l * mamba->config.dim], &w->norm[l * mamba->config.dim], mamba->config.dim, alpha, lamb);
+    }
+
+    apply_ema_update(g->final_norm_grad, w->final_norm, mamba->config.dim, alpha, lamb);
+
+    if (mamba->config.shared_classifier == 0) {
+        apply_ema_update(g->lm_head_grad, w->lm_head, mamba->config.rounded_vocab_size * mamba->config.dim, alpha, lamb);
+    }
+}
+
+
+void adamw_update(float* param, float* grad, AdamWState* state, int size, float learning_rate, float beta1, float beta2, float epsilon, float weight_decay, int t) {
+    for (int i = 0; i < size; ++i) {
+        // Update biased first moment estimate
+        state->m[i] = beta1 * state->m[i] + (1.0f - beta1) * grad[i];
+        // Update biased second raw moment estimate
+        state->v[i] = beta2 * state->v[i] + (1.0f - beta2) * grad[i] * grad[i];
+        // Compute bias-corrected first moment estimate
+        float m_hat = state->m[i] / (1.0f - powf(beta1, t));
+        // Compute bias-corrected second raw moment estimate
+        float v_hat = state->v[i] / (1.0f - powf(beta2, t));
+        // Update parameters
+        param[i] -= learning_rate * m_hat / (sqrtf(v_hat) + epsilon) + learning_rate * weight_decay * param[i];
+    }
+}
+
+void scale_gradients(MambaGradients* gradients, float scale_factor, Config* config) {
+    int n_layers = config->n_layers;
+    int dim = config->dim;
+    int d_inner = config->d_inner;
+    int dt_rank = config->dt_rank;
+    int d_state = config->d_state;
+    int d_conv = config->d_conv;
+    int rounded_vocab_size = config->rounded_vocab_size;
+
+    // Scale token embedding table gradients
+    for (int i = 0; i < rounded_vocab_size * dim; ++i) {
+        gradients->token_embedding_table_grad[i] *= scale_factor;
+    }
+
+    // Scale gradients for weights in each layer
+    for (int l = 0; l < n_layers; ++l) {
+        for (int i = 0; i < 2 * d_inner * dim; ++i) {
+            gradients->in_proj_grad[l * 2 * d_inner * dim + i] *= scale_factor;
+        }
+        for (int i = 0; i < d_inner * d_conv; ++i) {
+            gradients->conv1d_weight_grad[l * d_inner * d_conv + i] *= scale_factor;
+        }
+        for (int i = 0; i < d_inner; ++i) {
+            gradients->conv1d_bias_grad[l * d_inner + i] *= scale_factor;
+        }
+        for (int i = 0; i < (dt_rank + 2 * d_state) * d_inner; ++i) {
+            gradients->x_proj_grad[l * (dt_rank + 2 * d_state) * d_inner + i] *= scale_factor;
+        }
+        for (int i = 0; i < d_inner * dt_rank; ++i) {
+            gradients->dt_proj_weight_grad[l * d_inner * dt_rank + i] *= scale_factor;
+        }
+        for (int i = 0; i < d_inner; ++i) {
+            gradients->dt_proj_bias_grad[l * d_inner + i] *= scale_factor;
+        }
+        for (int i = 0; i < d_inner * d_state; ++i) {
+            gradients->A_grad[l * d_inner * d_state + i] *= scale_factor;
+        }
+        for (int i = 0; i < d_inner; ++i) {
+            gradients->D_grad[l * d_inner + i] *= scale_factor;
+        }
+        for (int i = 0; i < dim * d_inner; ++i) {
+            gradients->out_proj_grad[l * dim * d_inner + i] *= scale_factor;
+        }
+        for (int i = 0; i < dim; ++i) {
+            gradients->norm_grad[l * dim + i] *= scale_factor;
+        }
+    }
+
+    // Scale final layer gradients
+    for (int i = 0; i < dim; ++i) {
+        gradients->final_norm_grad[i] *= scale_factor;
+    }
+
+    // Scale classifier weights gradients if not shared
+    if (!config->shared_classifier) {
+        for (int i = 0; i < rounded_vocab_size * dim; ++i) {
+            gradients->lm_head_grad[i] *= scale_factor;
+        }
+    }
+}
+
+void backwards_layer(Mamba* mamba, unsigned long long l, float* dHiddenState, float* hiddenState, float* input) {
+    Config* p = &mamba->config;
+    MambaWeights* w = &mamba->weights;
+    MambaGradients* g = &mamba->gradients;
+    RunState* s = &mamba->state;
+    int dim = p->dim, d_inner = p->d_inner, d_conv = p->d_conv, d_state = p->d_state, dt_rank = p->dt_rank;
+
+    // Allocate memory for gradient variables
+    float* dY = (float*)calloc(d_inner, sizeof(float));
+    float* dZ = (float*)calloc(d_inner, sizeof(float));
+    float* dX = (float*)calloc(d_inner, sizeof(float));
+    float* dSsmState = (float*)calloc(d_state, sizeof(float));
+    float* dC = (float*)calloc(d_state, sizeof(float));
+    float* dA = (float*)calloc(d_inner * d_state, sizeof(float));
+    float* dB = (float*)calloc(d_inner * d_state, sizeof(float));
+    float* dTemp = (float*)calloc(d_inner * d_state, sizeof(float));
+    float* dDt = (float*)calloc(d_inner, sizeof(float));
+
+    // Backprop through matmul in the last operation of forward_layer
+    matmul_grad(dHiddenState, hiddenState, w->out_proj + l*dim*d_inner, dY, g->out_proj_grad + l*dim*d_inner, dim, d_inner);
+
+    // Backprop through elementwise_multiply_and_add for y
+    for (int i = 0; i < d_inner; i++) {
+        float siluZ = silu(s->xz[d_inner + i]); // z is s->xz + d_inner
+        dZ[i] += dY[i] * s->y[i] * (1 - siluZ); // Gradient for SiLU part
+        dX[i] += w->D[l*d_inner + i] * dY[i]; // Gradient for x part of elementwise_multiply_and_add
+        g->D_grad[l*d_inner + i] += dY[i] * siluZ; // Gradient for D
+    }
+
+    // Backprop through rowwise_dot_product for y
+    rowwise_dot_product_grad(dY, s->ssm_state, w->x_proj + l*(dt_rank+2*d_state)*d_inner + dt_rank + d_state, dSsmState, dC, d_inner, d_state);
+
+    // Backprop through ssm_state update
+    elementwise_multiply_grad(dTemp, s->conv_state, w->conv1d_weight + l * d_inner * d_conv, s->conv_state, g->conv1d_weight_grad + l * d_inner * d_conv, d_inner * d_conv);
+
+    broadcast_multiply_grad(dTemp, s->xz, dB, dX, dB, d_inner, d_state); // Note: x reused for gradient accumulation    
+
+    // Backprop through outer_product for dB
+    outer_product_grad(dB, dDt, s->x_db + dt_rank, dTemp, dX, d_inner, d_state);
+
+    // Backprop through broadcast_multiply for dA and dB
+    broadcast_multiply_grad(dA, dDt, w->A + l*d_inner*d_state, dDt, g->A_grad + l*d_inner*d_state, d_inner, d_state);
+
+    // Backprop through A and B discretization
+    for (int i = 0; i < d_inner * d_state; i++) {
+        dA[i] *= expf(s->dA[i]); // Gradient through exp
+    }
+
+    // Backprop through dt linear and softplus
+    linear_grad(dDt, s->x_db, w->dt_proj_weight + l*d_inner*dt_rank, w->dt_proj_bias + l*d_inner, s->x_db, g->dt_proj_weight_grad + l*d_inner*dt_rank, g->dt_proj_bias_grad + l*d_inner, d_inner, dt_rank);
+    for (int i = 0; i < d_inner; i++) {
+        dDt[i] *= softplus_grad(s->dt[i]); // Gradient through softplus
+    }
+
+    // Backprop through x_proj matmul
+    matmul_grad(s->x_db, s->xz, w->x_proj + l*(dt_rank+2*d_state)*d_inner, dX, g->x_proj_grad + l*(dt_rank+2*d_state)*d_inner, dt_rank+2*d_state, d_inner);
+
+    // Backprop through SiLU and conv1d in x computation
+    for (int i = 0; i < d_inner; i++) {
+        dX[i] *= silu_grad(s->xz[i]); // Gradient through SiLU
+    }
+    elementwise_add_grad(dX, dX, g->conv1d_bias_grad + l*d_inner, d_inner); // Bias grad for conv1d
+    sum_along_last_dim_grad(dX, dTemp, s->conv_state, d_inner); // Backprop sum_along_last_dim
+    elementwise_multiply_grad(dTemp, s->conv_state, w->conv1d_weight + l*d_inner*d_conv, s->conv_state, g->conv1d_weight_grad + l*d_inner*d_conv, d_inner * d_conv);
+
+    // Backprop through in_proj matmul
+    matmul_grad(s->xz, input, w->in_proj + l*2*d_inner*dim, dX, g->in_proj_grad + l*2*d_inner*dim, 2*d_inner, dim);
+
+    // Accumulate gradients for input from dX and dZ
+    for (int i = 0; i < d_inner; i++) {
+        input[i] += dX[i] + dZ[i];
+    }
+
+    // Free allocated memory
+    free(dY);
+    free(dZ);
+    free(dX);
+    free(dSsmState);
+    free(dC);
+    free(dA);
+    free(dB);
+    free(dTemp);
+    free(dDt);
+}
+
+
+void backward(Mamba* mamba, int* tokens, float** dLogits, int batch_size) {
+    Config* p = &mamba->config;
+    MambaWeights* w = &mamba->weights;
+    MambaGradients* g = &mamba->gradients;
+    OptimizerStates* opt_states = &mamba->optimizer_states;
+    RunState* s = &mamba->state;
+    int dim = p->dim, d_inner = p->d_inner, d_conv = p->d_conv, d_state = p->d_state, dt_rank = p->dt_rank;
+
+    // Allocate temporary storage for gradients that do not directly correspond to model parameters
+    float* dX = calloc(d_inner, sizeof(float));
+    float* dZ = calloc(d_inner, sizeof(float));
+    float* dY = calloc(d_inner, sizeof(float));
+    float* dDt = calloc(d_inner, sizeof(float)); // Note: dDt's size is d_inner after expansion in forward pass
+    float* dB = calloc(d_inner * d_state, sizeof(float));
+    float* dC = calloc(d_inner * d_state, sizeof(float));
+    float* dA = calloc(d_inner * d_state, sizeof(float));
+    float* dSsmState = calloc(d_inner * d_state, sizeof(float));
+    float* dTemp = calloc(d_inner * d_state, sizeof(float)); // For intermediate gradients
+    
+    // Gradient with respect to lm_head
+    for (int i = 0; i < p->rounded_vocab_size; i++) {
+        for (int j = 0; j < dim; j++) {
+            g->lm_head_grad[i * dim + j] = 0;
+            for (int k = 0; k < batch_size; k++) {
+                g->lm_head_grad[i * dim + j] += dLogits[k][i] * s->hidden_state[k * dim + j];
+            }
+        }
+    }
+
+    // Gradient with respect to hidden_state (dHiddenState)
+    float* dHiddenState = calloc(dim, sizeof(float));
+    for (int i = 0; i < dim; i++) {
+        dHiddenState[i] = 0;
+        for (int j = 0; j < p->rounded_vocab_size; j++) {
+            dHiddenState[i] += dLogits[0][j] * w->lm_head[j * dim + i]; // Assuming batch_size of 1 for simplicity
+        }
+    }
+    rmsnorm_grad(dHiddenState, s->hidden_state, w->final_norm, g->final_norm_grad, g->final_norm_grad, dim);
+
+
+
+    // Backpropagate through each layer in reverse order
+    for (int l = p->n_layers - 1; l >= 0; --l) {
+        // Assuming a function that computes the gradient of hidden state
+        float* dHiddenState = calloc(p->dim, sizeof(float)); // Gradient w.r.t. hidden state output of the layer
+        float* hiddenState = s->hidden_state; // The hidden state from the forward pass
+        float* input = s->input; // The input to the layer
+
+        // Compute gradients for layer l
+        backwards_layer(mamba, l, dHiddenState, hiddenState, input);
+
+        // Free the allocated memory for dHiddenState if not needed further
+        free(dHiddenState);
+    }
+
+        // Free allocated memory
+    free(dX);
+    free(dZ);
+    free(dY);
+    free(dDt);
+    free(dB);
+    free(dC);
+    free(dA);
+    free(dSsmState);
+    free(dTemp);
+
+}
+
+void update_parameters(Mamba* mamba, float learning_rate, float beta1, float beta2, float epsilon, float weight_decay, int t, int accumulate_steps) {
+    Config* p = &mamba->config;
+    MambaWeights* w = &mamba->weights;
+    MambaGradients* g = &mamba->gradients;
+    OptimizerStates* opt_states = &mamba->optimizer_states;
+    
+    // Scale gradients by the accumulation steps
+    scale_gradients(g, 1.0f / accumulate_steps, p);
+
+    // Apply ema gradient filter
+    gradfilter_ema(mamba, 0.666, 2.16);
+    
+    // Perform parameter updates using the scaled gradients
+        for (unsigned long long l = 0; l < p->n_layers; ++l) {
+        // Update weights and biases for each layer
+        adamw_update(w->in_proj + l * 2 * p->d_inner * p->dim, g->in_proj_grad + l * 2 * p->d_inner * p->dim, opt_states->in_proj_state + l, 2 * p->d_inner * p->dim, learning_rate, beta1, beta2, epsilon, weight_decay, t);
+        adamw_update(w->conv1d_weight + l * p->d_inner * p->d_conv, g->conv1d_weight_grad + l * p->d_inner * p->d_conv, opt_states->conv1d_weight_state + l, p->d_inner * p->d_conv, learning_rate, beta1, beta2, epsilon, weight_decay, t);
+        adamw_update(w->conv1d_bias + l * p->d_inner, g->conv1d_bias_grad + l * p->d_inner, opt_states->conv1d_bias_state + l, p->d_inner, learning_rate, beta1, beta2, epsilon, weight_decay, t);
+        adamw_update(w->x_proj + l * (p->dt_rank + 2 * p->d_state) * p->d_inner, g->x_proj_grad + l * (p->dt_rank + 2 * p->d_state) * p->d_inner, opt_states->x_proj_state + l, (p->dt_rank + 2 * p->d_state) * p->d_inner, learning_rate, beta1, beta2, epsilon, weight_decay, t);
+        adamw_update(w->dt_proj_weight + l * p->d_inner * p->dt_rank, g->dt_proj_weight_grad + l * p->d_inner * p->dt_rank, opt_states->dt_proj_weight_state + l, p->d_inner * p->dt_rank, learning_rate, beta1, beta2, epsilon, weight_decay, t);
+        adamw_update(w->dt_proj_bias + l * p->d_inner, g->dt_proj_bias_grad + l * p->d_inner, opt_states->dt_proj_bias_state + l, p->d_inner, learning_rate, beta1, beta2, epsilon, weight_decay, t);
+        adamw_update(w->A + l * p->d_inner * p->d_state, g->A_grad + l * p->d_inner * p->d_state, opt_states->A_state + l, p->d_inner * p->d_state, learning_rate, beta1, beta2, epsilon, weight_decay, t);
+        adamw_update(w->D + l * p->d_inner, g->D_grad + l * p->d_inner, opt_states->D_state + l, p->d_inner, learning_rate, beta1, beta2, epsilon, weight_decay, t);
+        adamw_update(w->out_proj + l * p->dim * p->d_inner, g->out_proj_grad + l * p->dim * p->d_inner, opt_states->out_proj_state + l, p->dim * p->d_inner, learning_rate, beta1, beta2, epsilon, weight_decay, t);
+        adamw_update(w->norm + l * p->dim, g->norm_grad + l * p->dim, opt_states->norm_state + l, p->dim, learning_rate, beta1, beta2, epsilon, weight_decay, t);
+    }
+
+    // Update final layer parameters
+    adamw_update(w->final_norm, g->final_norm_grad, opt_states->final_norm_state, p->dim, learning_rate, beta1, beta2, epsilon, weight_decay, t);
+
+    // Update token embedding and possibly shared classifier weights
+    adamw_update(w->token_embedding_table, g->token_embedding_table_grad, opt_states->token_embedding_table_state, p->rounded_vocab_size * p->dim, learning_rate, beta1, beta2, epsilon, weight_decay, t);
+    if (!p->shared_classifier) {
+        adamw_update(w->lm_head, g->lm_head_grad, opt_states->lm_head_state, p->rounded_vocab_size * p->dim, learning_rate, beta1, beta2, epsilon, weight_decay, t);
+    }
+}
+
+void zero_gradients(MambaGradients* gradients, Config* config) {
+    int n_layers = config->n_layers;
+    int vocab_size = config->vocab_size;
+    int dim = config->dim;
+    int d_inner = config->d_inner;
+    int dt_rank = config->dt_rank;
+    int d_state = config->d_state;
+    int d_conv = config->d_conv;
+    int rounded_vocab_size = config->rounded_vocab_size;
+
+    // Zero token embedding table gradients
+    memset(gradients->token_embedding_table_grad, 0, sizeof(float) * rounded_vocab_size * dim);
+
+    // Zero gradients for weights in each layer
+    for (int l = 0; l < n_layers; ++l) {
+        memset(gradients->in_proj_grad + l * 2 * d_inner * dim, 0, sizeof(float) * 2 * d_inner * dim);
+        memset(gradients->conv1d_weight_grad + l * d_inner * d_conv, 0, sizeof(float) * d_inner * d_conv);
+        memset(gradients->conv1d_bias_grad + l * d_inner, 0, sizeof(float) * d_inner);
+        memset(gradients->x_proj_grad + l * (dt_rank + 2 * d_state) * d_inner, 0, sizeof(float) * (dt_rank + 2 * d_state) * d_inner);
+        memset(gradients->dt_proj_weight_grad + l * d_inner * dt_rank, 0, sizeof(float) * d_inner * dt_rank);
+        memset(gradients->dt_proj_bias_grad + l * d_inner, 0, sizeof(float) * d_inner);
+        memset(gradients->A_grad + l * d_inner * d_state, 0, sizeof(float) * d_inner * d_state);
+        memset(gradients->D_grad + l * d_inner, 0, sizeof(float) * d_inner);
+        memset(gradients->out_proj_grad + l * dim * d_inner, 0, sizeof(float) * dim * d_inner);
+        memset(gradients->norm_grad + l * dim, 0, sizeof(float) * dim);
+    }
+
+    // Zero final layer gradients
+    memset(gradients->final_norm_grad, 0, sizeof(float) * dim);
+
+    // Zero classifier weights gradients if not shared
+    if (!config->shared_classifier) {
+        memset(gradients->lm_head_grad, 0, sizeof(float) * rounded_vocab_size * dim);
+    }
+}
+
+
+void training_loop(Mamba* mamba, Config* config, int** tokens, int* targets, int num_batches, int batch_size, int accumulate_steps) {
+    // Hyperparameters
+    float learning_rate = 0.001f;
+    float beta1 = 0.9f;
+    float beta2 = 0.999f;
+    float epsilon = 1e-8f;
+    float weight_decay = 0.01f;
+    int t = 1; // AdamW timestep
+
+    // Allocate memory for dLogits outside the loop to reuse
+    float** dLogits = (float**)malloc(batch_size * sizeof(float*));
+    for (int i = 0; i < batch_size; ++i) {
+        dLogits[i] = (float*)calloc(mamba->config.vocab_size, sizeof(float));
+    }
+
+    for (int epoch = 0; epoch < NUM_EPOCHS; ++epoch) {
+        for (int batch_idx = 0; batch_idx < num_batches; ++batch_idx) {
+            zero_gradients(&mamba->gradients, config);
+
+            float total_loss = 0.0f;
+            for (int step = 0; step < accumulate_steps; ++step) {
+                int* batch_tokens = tokens[batch_idx * accumulate_steps + step];
+                int* batch_targets = targets + batch_idx * accumulate_steps * batch_size + step * batch_size;
+
+                // Forward pass for the batch
+                for (int i = 0; i < batch_size; ++i) {
+                    float* logits = forward(mamba, batch_tokens[i]);
+                    memcpy(dLogits[i], logits, mamba->config.vocab_size * sizeof(float)); // Copy logits to dLogits for gradient calculation
+                }
+
+                // Compute loss and gradients
+                float batch_loss = cross_entropy_loss_and_grad(dLogits, batch_targets, batch_size, mamba->config.vocab_size, dLogits);
+                total_loss += batch_loss;
+
+                // Backward pass
+                backward(mamba, batch_tokens, dLogits, batch_size);
+            }
+
+            // Update parameters
+            update_parameters(mamba, learning_rate, beta1, beta2, epsilon, weight_decay, t++, accumulate_steps);
+
+            // Optionally, print the average loss for the batch
+            printf("Epoch %d, Batch %d, Loss: %.4f\n", epoch, batch_idx, total_loss / accumulate_steps);
+        }
+    }
+
+    // Free dLogits memory
+    for (int i = 0; i < batch_size; ++i) {
+        free(dLogits[i]);
+    }
+    free(dLogits);
+}
+
+
 // ----------------------------------------------------------------------------
 // The Byte Pair Encoding (BPE) Tokenizer that translates strings <-> tokens
 
