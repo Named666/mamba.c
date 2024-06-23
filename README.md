@@ -91,4 +91,4 @@ Feel free to contribute and send a PR
 
 ## License
 
-MIT
+AGPL3.0
